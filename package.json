@@ -4,6 +4,9 @@
   "description": "MCP server for YNAB credit card reconciliation",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "ynab-mcp": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
