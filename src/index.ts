@@ -3,6 +3,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { formatCurrency } from './utils/milliunits.js';
 
 function formatError(error: unknown): string {
   // YNAB ResponseError has an 'error' property that contains the actual error details
@@ -35,10 +36,16 @@ import {
   createTransactionsBatch,
   getUnclearedTransactions,
   getClearedTransactions,
+  getPendingTransactions,
   clearTransaction,
   updateTransaction,
 } from './tools/transactions.js';
 import { reconciliationCheck } from './tools/reconciliation.js';
+import {
+  getTransactionsByDateRange,
+  getSpendingByCategory,
+  getIncomeSummary,
+} from './tools/analytics.js';
 
 const server = new McpServer({
   name: 'ynab-mcp',
@@ -254,7 +261,7 @@ server.tool(
 // Tool: create_transaction
 server.tool(
   'create_transaction',
-  'Create a single transaction. Amounts are in dollars (negative for charges, positive for credits). Defaults to cleared status for reconciliation workflow.',
+  'Create a single transaction. Amounts are in dollars (negative for charges, positive for credits). Defaults to cleared status for reconciliation workflow. Supports SPLIT TRANSACTIONS: use "subtransactions" to divide a single transaction across multiple categories (e.g., splitting a Costco purchase between Groceries, Household Items, and Gas).',
   {
     budget_id: z
       .string()
@@ -265,21 +272,31 @@ server.tool(
     amount: z
       .number()
       .describe(
-        'Amount in dollars (negative for charges like -25.99, positive for credits)'
+        'Amount in dollars (negative for charges like -25.99, positive for credits). For split transactions, this should equal the sum of all subtransactions.'
       ),
     payee_name: z.string().describe('Name of the payee'),
-    category_id: z.string().optional().describe('Category ID for the transaction'),
+    category_id: z.string().optional().describe('Category ID for the transaction (cannot be used with subtransactions)'),
     memo: z.string().optional().describe('Optional memo/note'),
     cleared: z
       .boolean()
       .optional()
       .describe('Whether transaction is cleared (defaults to true for reconciliation)'),
+    subtransactions: z
+      .array(
+        z.object({
+          category_id: z.string().describe('Category ID for this subtransaction'),
+          amount: z.number().describe('Amount in dollars for this subtransaction (e.g., -50.00 for groceries, -25.00 for gas)'),
+          memo: z.string().optional().describe('Optional memo for this subtransaction'),
+        })
+      )
+      .optional()
+      .describe('To SPLIT a transaction across multiple categories, provide subtransactions array. Each subtransaction has its own category_id and amount. The sum of all subtransaction amounts must equal the main transaction amount. Mutually exclusive with category_id.'),
   },
-  async ({ budget_id, account_id, date, amount, payee_name, category_id, memo, cleared }) => {
+  async ({ budget_id, account_id, date, amount, payee_name, category_id, memo, cleared, subtransactions }) => {
     try {
       const result = await createTransaction(
         account_id,
-        { date, amount, payee_name, category_id, memo, cleared },
+        { date, amount, payee_name, category_id, memo, cleared, subtransactions },
         budget_id
       );
       return {
@@ -307,7 +324,7 @@ server.tool(
 // Tool: create_transactions_batch
 server.tool(
   'create_transactions_batch',
-  'Create multiple transactions at once. All transactions go to the same account. Amounts are in dollars. Ideal for bulk reconciliation from credit card statements.',
+  'Create multiple transactions at once. All transactions go to the same account. Amounts are in dollars. Ideal for bulk reconciliation from credit card statements. Supports SPLIT TRANSACTIONS: use "subtransactions" on individual transactions to divide them across multiple categories.',
   {
     budget_id: z
       .string()
@@ -318,11 +335,21 @@ server.tool(
       .array(
         z.object({
           date: z.string().describe('Transaction date in ISO format (YYYY-MM-DD)'),
-          amount: z.number().describe('Amount in dollars (negative for charges)'),
+          amount: z.number().describe('Amount in dollars (negative for charges). For split transactions, this should equal the sum of all subtransactions.'),
           payee_name: z.string().describe('Name of the payee'),
-          category_id: z.string().optional().describe('Category ID'),
+          category_id: z.string().optional().describe('Category ID (cannot be used with subtransactions)'),
           memo: z.string().optional().describe('Optional memo/note'),
           cleared: z.boolean().optional().describe('Whether cleared (defaults to true)'),
+          subtransactions: z
+            .array(
+              z.object({
+                category_id: z.string().describe('Category ID for this subtransaction'),
+                amount: z.number().describe('Amount in dollars for this subtransaction'),
+                memo: z.string().optional().describe('Optional memo for this subtransaction'),
+              })
+            )
+            .optional()
+            .describe('To SPLIT a transaction across multiple categories, provide subtransactions array. Each subtransaction has its own category_id and amount. The sum must equal the main transaction amount. Mutually exclusive with category_id.'),
         })
       )
       .describe('Array of transactions to create'),
@@ -450,6 +477,53 @@ server.tool(
   }
 );
 
+// Tool: get_pending_transactions
+server.tool(
+  'get_pending_transactions',
+  'Get all pending (uncleared) transactions for an account. These are transactions that have not yet posted to the account.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses default or last-used if not provided)'),
+    account_id: z.string().describe('The account ID to get pending transactions for'),
+    since_date: z
+      .string()
+      .optional()
+      .describe('Only return transactions on or after this date (YYYY-MM-DD)'),
+  },
+  async ({ budget_id, account_id, since_date }) => {
+    try {
+      const transactions = await getPendingTransactions(account_id, budget_id, since_date);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                count: transactions.length,
+                transactions,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error getting pending transactions: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Tool: clear_transaction
 server.tool(
   'clear_transaction',
@@ -489,7 +563,7 @@ server.tool(
 // Tool: update_transaction
 server.tool(
   'update_transaction',
-  'Update an existing transaction. Can modify amount, date, payee, category, memo, or cleared status.',
+  'Update an existing transaction. Can modify amount, date, payee, category, memo, or cleared status. Supports converting a simple transaction to a SPLIT TRANSACTION by providing subtransactions to divide it across multiple categories.',
   {
     budget_id: z
       .string()
@@ -502,15 +576,25 @@ server.tool(
       .describe('New amount in dollars (negative for charges, positive for credits)'),
     date: z.string().optional().describe('New date in ISO format (YYYY-MM-DD)'),
     payee_name: z.string().optional().describe('New payee name'),
-    category_id: z.string().optional().describe('New category ID'),
+    category_id: z.string().optional().describe('New category ID (cannot be used with subtransactions)'),
     memo: z.string().optional().describe('New memo/note'),
     cleared: z.boolean().optional().describe('Whether transaction is cleared'),
+    subtransactions: z
+      .array(
+        z.object({
+          category_id: z.string().describe('Category ID for this subtransaction'),
+          amount: z.number().describe('Amount in dollars for this subtransaction'),
+          memo: z.string().optional().describe('Optional memo for this subtransaction'),
+        })
+      )
+      .optional()
+      .describe('Convert to SPLIT TRANSACTION by providing subtransactions array. Each subtransaction divides the total amount across different categories. Sum of subtransactions must equal the main transaction amount. Mutually exclusive with category_id.'),
   },
-  async ({ budget_id, transaction_id, amount, date, payee_name, category_id, memo, cleared }) => {
+  async ({ budget_id, transaction_id, amount, date, payee_name, category_id, memo, cleared, subtransactions }) => {
     try {
       const result = await updateTransaction(
         transaction_id,
-        { amount, date, payee_name, category_id, memo, cleared },
+        { amount, date, payee_name, category_id, memo, cleared, subtransactions },
         budget_id
       );
       return {
@@ -568,6 +652,169 @@ server.tool(
           {
             type: 'text',
             text: `Error checking reconciliation: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_transactions_by_date_range
+server.tool(
+  'get_transactions_by_date_range',
+  'Get all transactions across all accounts within a date range. Returns transaction details including amount, payee, category, and account. Useful for year-end analysis, monthly reviews, and financial reporting.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses default or last-used if not provided)'),
+    start_date: z
+      .string()
+      .describe('Start date in ISO format (YYYY-MM-DD). Transactions on or after this date will be included.'),
+    end_date: z
+      .string()
+      .optional()
+      .describe('End date in ISO format (YYYY-MM-DD). If not provided, returns all transactions from start_date to present.'),
+  },
+  async ({ budget_id, start_date, end_date }) => {
+    try {
+      const transactions = await getTransactionsByDateRange(start_date, end_date, budget_id);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                count: transactions.length,
+                start_date,
+                end_date: end_date || 'present',
+                transactions,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error getting transactions by date range: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_spending_by_category
+server.tool(
+  'get_spending_by_category',
+  'Analyze spending aggregated by category for a date range. Returns total spent, transaction count, and average transaction size per category. Excludes income and transfers, focusing only on spending. Categories are sorted by total spent (highest first).',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses default or last-used if not provided)'),
+    start_date: z
+      .string()
+      .describe('Start date in ISO format (YYYY-MM-DD)'),
+    end_date: z
+      .string()
+      .optional()
+      .describe('End date in ISO format (YYYY-MM-DD). If not provided, analyzes from start_date to present.'),
+  },
+  async ({ budget_id, start_date, end_date }) => {
+    try {
+      const categorySpending = await getSpendingByCategory(start_date, end_date, budget_id);
+      const totalSpent = categorySpending.reduce((sum, cat) => sum + cat.total_spent, 0);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                period: {
+                  start_date,
+                  end_date: end_date || 'present',
+                },
+                summary: {
+                  total_spent: totalSpent,
+                  total_spent_formatted: formatCurrency(totalSpent * 1000),
+                  category_count: categorySpending.length,
+                  total_transactions: categorySpending.reduce((sum, cat) => sum + cat.transaction_count, 0),
+                },
+                categories: categorySpending,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error getting spending by category: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_income_summary
+server.tool(
+  'get_income_summary',
+  'Get income summary for a date range. Returns total income, transaction count, and breakdown by income source (payee). Only includes positive transactions (income, refunds, reimbursements). Sources are sorted by total income (highest first).',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses default or last-used if not provided)'),
+    start_date: z
+      .string()
+      .describe('Start date in ISO format (YYYY-MM-DD)'),
+    end_date: z
+      .string()
+      .optional()
+      .describe('End date in ISO format (YYYY-MM-DD). If not provided, analyzes from start_date to present.'),
+  },
+  async ({ budget_id, start_date, end_date }) => {
+    try {
+      const incomeSummary = await getIncomeSummary(start_date, end_date, budget_id);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                period: {
+                  start_date,
+                  end_date: end_date || 'present',
+                },
+                income: incomeSummary,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error getting income summary: ${formatError(error)}`,
           },
         ],
         isError: true,
