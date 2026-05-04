@@ -1,6 +1,15 @@
 # YNAB MCP Server
 
-An MCP (Model Context Protocol) server for YNAB (You Need A Budget) designed for reconciliation, local-first analysis, and weekly/monthly finance reviews.
+An MCP (Model Context Protocol) server for YNAB (You Need A Budget) designed for reconciliation, local-first analysis, weekly/monthly finance reviews, and a read-only **budget coach** that splits budget planning advice from transaction categorization suggestions.
+
+## Two coach modes (read-only by design)
+
+The budget coach has two distinct jobs and they stay separate in tools, prompts, and approval posture:
+
+1. **Planning / assigning budget** — advisory only. Tools read live YNAB data and surface Ready to Assign, overspent categories, underfunded targets, funding-source candidates, and upcoming obligations. They never assign money or change targets without explicit human approval.
+2. **Transaction categorization** — evidence-backed suggestions only. Tools surface uncategorized/unapproved transactions, group obvious duplicates, and propose a category with confidence (high/medium/low), rationale, and prior-example evidence. They never write categories.
+
+See `docs/budget-coach-operating-model.md` for the full operating model. Phase 2 ships read-only tools only; any future write tool must default to dry-run and require explicit approval.
 
 ## Features
 
@@ -10,6 +19,7 @@ An MCP (Model Context Protocol) server for YNAB (You Need A Budget) designed for
 - **Reconciliation support** - Compare YNAB cleared balances to actual bank balances
 - **Local SQLite mirror** - Incrementally sync YNAB to a local SQLite database (`node:sqlite`) using YNAB's `server_knowledge` so subsequent runs only fetch deltas
 - **Local-only finance reviews** - Generate transaction-review queues and weekly/monthly summaries from the local mirror without hitting the YNAB API
+- **Live budget coach** - Read-only planning snapshot, months-needing-help triage, overspending explanation, categorization queue, category suggestions, and operating-model weekly/monthly reviews built on live YNAB reads
 
 ## Installation
 
@@ -118,6 +128,22 @@ get_weekly_finance_review { budget_id }
 get_monthly_finance_review { budget_id, month: "2026-04" }
 ```
 
+### Budget Coach Tools (live, read-only)
+
+These tools read the YNAB API directly and never mutate the budget. They drive the two-mode coach: planning advice and categorization suggestions.
+
+| Tool | Mode | Description |
+|------|------|-------------|
+| `get_budget_planning_snapshot` | planning | Ready to Assign, overspent categories, underfunded targets, hard obligations, everyday/true-expense/savings classifications, funding-source candidates, upcoming scheduled obligations, and planning priorities for the month. |
+| `find_months_needing_budget_help` | planning | Inspects current and recent months and returns reasons (`ready_to_assign`, `overspent_categories`, `underfunded_targets`, `previous_month_overspending`, `credit_card_payment_issues`). |
+| `explain_overspending` | planning | Plain-language explanation of overspent categories with likely funding sources. Optional `category_id` for a focused explanation. |
+| `get_categorization_queue` | categorization | Live list of uncategorized/unapproved/flagged transactions with duplicate-payee groupings. Excludes transfers. |
+| `suggest_transaction_categories` | categorization | Suggests a category per transaction with confidence (high/medium/low), rationale, evidence (prior examples, payee default), and ranked alternatives. |
+| `get_weekly_budget_review` | review | Operating-model weekly review: inbox health, overspending + funding source candidates, cash assignment, notable spending (large/unusual/new recurring), and explicit next actions. |
+| `get_monthly_budget_review` | review | Operating-model monthly review: month close readiness, budget performance, true-expense status, family-narrative anchors, next-month plan with priorities and questions for humans. |
+
+Approval posture: every coach tool above is read-only. Any future write tool (e.g., `apply_transaction_categories`, `apply_assignment_plan`) must default to dry-run and require explicit user approval before mutating YNAB.
+
 ## Reconciliation Workflow
 
 1. **Show accounts**: "Show me my accounts"
@@ -173,8 +199,16 @@ src/
     ynab-sync-client.ts Adapter from ynab.API to YnabSyncClient
     reviews.ts          Local-only weekly/monthly summaries and review queue
     types.ts            Resource shapes shared by sync + adapter + tests
+  budget-coach/
+    reader.ts           YnabCoachReader interface + live YNAB SDK adapter (testable seam)
+    category-jobs.ts    Heuristics that bucket categories into hard obligation / everyday /
+                        true expense / savings / discretionary / credit card / inflow
+    planning.ts         Planning snapshot, months-needing-help, overspending explanation
+    categorization.ts   Categorization queue + payee-history + keyword suggestions
+    reviews.ts          Operating-model weekly/monthly budget reviews (live reads)
   tools/
     local-sync.ts       Thin wrappers exposed to index.ts as MCP tools
+    budget-coach.ts     Wire-up that resolves budget id and calls the live coach reader
     ...                 Existing read/write tools
   __tests__/            node:test specs (run as `npm test`)
 ```
