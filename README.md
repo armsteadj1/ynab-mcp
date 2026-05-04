@@ -39,6 +39,8 @@ npm run build
 | `YNAB_API_TOKEN` | Yes (for sync/write tools) | Your YNAB Personal Access Token. Never logged. Local-read tools (review/status) do not require it once data is synced. |
 | `YNAB_BUDGET_ID` | No | Default budget ID. The `sync_ynab_data` tool requires an explicit budget ID — the `last-used` alias is not supported there. |
 | `YNAB_LOCAL_DB_PATH` | No | Path to the local SQLite mirror. Defaults to `~/.ynab-mcp/ynab.db`. The directory is created if needed. |
+| `YNAB_EMAIL_ACCOUNT` | No | Default Gmail account used by `suggest_transaction_categories` when `include_email_evidence` is true. Can also be passed per-call. |
+| `GOG_KEYRING_PASSWORD` | No | Forwarded to the local [`gog`](https://github.com/jordanmccullough/gogcli) CLI when looking up Gmail evidence. Read-only Gmail search; never used to send mail. |
 
 The local mirror lives **outside the repo** by default and contains YNAB data only — no API tokens. Delete the file to fully reset, or call `sync_ynab_data` with `full_resync: true` to discard `server_knowledge` and refetch.
 
@@ -138,11 +140,22 @@ These tools read the YNAB API directly and never mutate the budget. They drive t
 | `find_months_needing_budget_help` | planning | Inspects current and recent months and returns reasons (`ready_to_assign`, `overspent_categories`, `underfunded_targets`, `previous_month_overspending`, `credit_card_payment_issues`). |
 | `explain_overspending` | planning | Plain-language explanation of overspent categories with likely funding sources. Optional `category_id` for a focused explanation. |
 | `get_categorization_queue` | categorization | Live list of uncategorized/unapproved/flagged transactions with duplicate-payee groupings. Excludes transfers. |
-| `suggest_transaction_categories` | categorization | Suggests a category per transaction with confidence (high/medium/low), rationale, evidence (prior examples, payee default), and ranked alternatives. |
+| `suggest_transaction_categories` | categorization | Suggests a category per transaction with confidence (high/medium/low), rationale, evidence (prior examples, payee default), ranked alternatives, and a `safe_to_apply` / `review_state` decision. Optional `include_email_evidence: true` enriches each suggestion with read-only Gmail context (subject/from/date/labels only) via the local `gog` CLI; Amazon-like merchants are held for human review unless item-level email evidence is present. |
 | `get_weekly_budget_review` | review | Operating-model weekly review: inbox health, overspending + funding source candidates, cash assignment, notable spending (large/unusual/new recurring), and explicit next actions. |
 | `get_monthly_budget_review` | review | Operating-model monthly review: month close readiness, budget performance, true-expense status, family-narrative anchors, next-month plan with priorities and questions for humans. |
 
 Approval posture: every coach tool above is read-only. Any future write tool (e.g., `apply_transaction_categories`, `apply_assignment_plan`) must default to dry-run and require explicit user approval before mutating YNAB.
+
+#### Optional Gmail evidence for categorization
+
+`suggest_transaction_categories` can correlate each transaction with recent emails to add merchant/context signals. Posture:
+
+- **Off by default.** Pass `include_email_evidence: true` to opt in.
+- **Read-only.** Uses the local `gog gmail messages search` CLI. The MCP server never sends mail, never modifies labels, never archives or deletes anything. Only `id`, `date`, `from`, `subject`, and `labels` are read.
+- **Bounded.** Each call has a per-transaction timeout, a max message count, and a `±email_window_days` date window around the transaction. Default lookup limit is 25 transactions per call (`email_evidence_limit`).
+- **Account selection.** `email_account` overrides `YNAB_EMAIL_ACCOUNT`, which overrides the personal default.
+- **Mixed-merchant guard.** Amazon-like payees are kept in `needs_human_review` even at high confidence unless the email evidence is item-level (e.g. `Your Amazon.com order of "..."`, `Shipped: ...`, or an explicit invoice/receipt subject).
+- **Confidence lift only when warranted.** Email signals can lift an ambiguous *low* suggestion to *medium*, but never auto-promote anything to `safe_to_apply`. Auto-apply still requires `high` confidence plus item-level evidence for Amazon-like merchants.
 
 ## Reconciliation Workflow
 

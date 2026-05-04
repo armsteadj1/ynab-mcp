@@ -1194,7 +1194,7 @@ server.tool(
 // Tool: suggest_transaction_categories
 server.tool(
   'suggest_transaction_categories',
-  'Suggest categories for uncategorized/unapproved transactions using payee history, prior approved categorizations, and merchant keywords. Each suggestion includes confidence (high/medium/low), rationale, and evidence. Read-only; no categories are applied.',
+  'Suggest categories for uncategorized/unapproved transactions using payee history, prior approved categorizations, and merchant keywords. Each suggestion includes confidence (high/medium/low), rationale, evidence, and a safe_to_apply flag. Optional read-only Gmail evidence (subject/from/date/labels only) via the local `gog` CLI can enrich the rationale and gate Amazon-like merchants. Read-only; no categories are applied and no email is sent.',
   {
     budget_id: z
       .string()
@@ -1215,14 +1215,58 @@ server.tool(
       .max(200)
       .optional()
       .describe('Max suggestions to return (default 50).'),
+    include_email_evidence: z
+      .boolean()
+      .optional()
+      .describe('Enrich suggestions with read-only Gmail evidence using the local `gog` CLI. Off by default. Subject/from/date/labels only — no email contents are read, sent, or modified.'),
+    email_account: z
+      .string()
+      .optional()
+      .describe('Gmail account to query (defaults to YNAB_EMAIL_ACCOUNT env var, then armsteadj1@gmail.com).'),
+    email_window_days: z
+      .number()
+      .int()
+      .positive()
+      .max(30)
+      .optional()
+      .describe('Date window (in days, +/-) around each transaction when searching Gmail. Defaults to 7.'),
+    email_max_results: z
+      .number()
+      .int()
+      .positive()
+      .max(20)
+      .optional()
+      .describe('Max Gmail messages to retrieve per transaction. Defaults to 5.'),
+    email_evidence_limit: z
+      .number()
+      .int()
+      .positive()
+      .max(200)
+      .optional()
+      .describe('Max number of transactions to look up Gmail evidence for in one call. Defaults to 25.'),
   },
-  async ({ budget_id, since_date, transaction_ids, limit }) => {
+  async ({
+    budget_id,
+    since_date,
+    transaction_ids,
+    limit,
+    include_email_evidence,
+    email_account,
+    email_window_days,
+    email_max_results,
+    email_evidence_limit,
+  }) => {
     try {
       const result = await runSuggestCategories({
         budgetId: budget_id,
         sinceDate: since_date,
         transactionIds: transaction_ids,
         limit,
+        includeEmailEvidence: include_email_evidence,
+        emailAccount: email_account,
+        emailWindowDays: email_window_days,
+        emailMaxResults: email_max_results,
+        emailEvidenceLimit: email_evidence_limit,
       });
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],

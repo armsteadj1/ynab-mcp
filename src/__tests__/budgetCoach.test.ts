@@ -14,8 +14,56 @@ import {
   getMonthlyBudgetReview,
   getWeeklyBudgetReview,
 } from '../budget-coach/reviews.js';
+import {
+  buildGmailQueries,
+  classifyEmailSignals,
+  pickMerchantTerm,
+  type EmailEvidenceProvider,
+  type TransactionEmailEvidence,
+} from '../budget-coach/email-evidence.js';
 import { createCoachFakeReader } from './budgetCoachFakeReader.js';
 import { COACH_BUDGET_ID, makeCoachFixtureData } from './budgetCoachFixtures.js';
+
+interface FakeEmailHandle {
+  provider: EmailEvidenceProvider;
+  calls: string[];
+}
+
+function fakeEmailEvidenceProvider(
+  responses: Record<string, TransactionEmailEvidence | null>
+): FakeEmailHandle {
+  const calls: string[] = [];
+  return {
+    calls,
+    provider: {
+      async searchForTransaction(tx) {
+        calls.push(tx.id);
+        if (Object.prototype.hasOwnProperty.call(responses, tx.id)) {
+          return responses[tx.id];
+        }
+        return null;
+      },
+    },
+  };
+}
+
+function makeFakeEvidence(
+  transactionId: string,
+  overrides: Partial<TransactionEmailEvidence> = {}
+): TransactionEmailEvidence {
+  return {
+    transaction_id: transactionId,
+    source: 'gmail',
+    account: 'fake@example.com',
+    merchant_term: 'fake',
+    queries: [],
+    messages: [],
+    signals: [],
+    has_specific_item_evidence: false,
+    notes: [],
+    ...overrides,
+  };
+}
 
 test('planning snapshot reports Ready to Assign and classifies categories', async () => {
   const reader = createCoachFakeReader(makeCoachFixtureData());
@@ -255,6 +303,243 @@ test('monthly budget review reports close readiness, performance, and next-month
   assert.ok(Array.isArray(review.next_month_plan.suggested_priorities));
   assert.ok(review.next_month_plan.suggested_priorities.length > 0);
   assert.ok(Array.isArray(review.next_month_plan.questions_for_humans));
+});
+
+test('suggest_transaction_categories: no email provider calls when disabled (default)', async () => {
+  const reader = createCoachFakeReader(makeCoachFixtureData());
+  const fake = fakeEmailEvidenceProvider({});
+  const result = await suggestTransactionCategories(reader, {
+    budgetId: COACH_BUDGET_ID,
+    sinceDate: '2026-04-01',
+    emailEvidenceProvider: fake.provider,
+  });
+
+  assert.equal(fake.calls.length, 0, 'provider should not be called when includeEmailEvidence is false');
+  assert.equal(result.email_evidence_used, false);
+  assert.equal(result.email_evidence_lookups, 0);
+  for (const s of result.suggestions) {
+    assert.equal(s.email_evidence, null);
+  }
+  assert.ok(
+    result.notes.some((n) => n.toLowerCase().includes('gmail evidence disabled')),
+    'notes should mention gmail evidence is off'
+  );
+});
+
+test('suggest_transaction_categories: email evidence is attached when enabled', async () => {
+  const reader = createCoachFakeReader(makeCoachFixtureData());
+  const fake = fakeEmailEvidenceProvider({
+    'tx-grocery-needs-cat': makeFakeEvidence('tx-grocery-needs-cat', {
+      merchant_term: 'local',
+      messages: [
+        {
+          id: 'm1',
+          date: '2026-05-02 09:00',
+          from: 'Local Grocer <receipts@localgrocer.example>',
+          subject: 'Receipt for your purchase',
+          labels: ['INBOX'],
+        },
+      ],
+      signals: ['generic_receipt'],
+      has_specific_item_evidence: false,
+      notes: ['Gmail matched 1 message(s)'],
+    }),
+    'tx-shell-gas': null,
+  });
+
+  const result = await suggestTransactionCategories(reader, {
+    budgetId: COACH_BUDGET_ID,
+    sinceDate: '2026-04-01',
+    includeEmailEvidence: true,
+    emailEvidenceProvider: fake.provider,
+  });
+
+  assert.equal(result.email_evidence_used, true);
+  assert.ok(result.email_evidence_lookups > 0, 'at least one transaction should have been looked up');
+  assert.ok(fake.calls.includes('tx-grocery-needs-cat'));
+
+  const grocery = result.suggestions.find((s) => s.transaction_id === 'tx-grocery-needs-cat');
+  assert.ok(grocery, 'grocery suggestion present');
+  assert.ok(grocery.email_evidence, 'grocery should carry email evidence');
+  assert.equal(grocery.email_evidence!.signals[0], 'generic_receipt');
+  assert.equal(grocery.email_evidence!.messages.length, 1);
+  assert.ok(
+    grocery.evidence.notes.some((n) => n.startsWith('email')),
+    'evidence notes should reference email'
+  );
+  // Grocery is high-confidence + non-Amazon → safe to apply.
+  assert.equal(grocery.suggestion.confidence, 'high');
+  assert.equal(grocery.safe_to_apply, true);
+  assert.equal(grocery.review_state, 'safe_to_apply');
+
+  assert.ok(
+    result.notes.some((n) => n.toLowerCase().includes('gmail evidence enabled')),
+    'notes should mention gmail evidence is on'
+  );
+});
+
+test('suggest_transaction_categories: item-level email evidence upgrades an ambiguous transaction', async () => {
+  const reader = createCoachFakeReader(makeCoachFixtureData());
+  const fake = fakeEmailEvidenceProvider({
+    'tx-ambig': makeFakeEvidence('tx-ambig', {
+      merchant_term: 'random',
+      messages: [
+        {
+          id: 'mr1',
+          date: '2026-05-03 19:30',
+          from: 'OpenTable <receipts@opentable.com>',
+          subject: 'Receipt for your dinner at Random Store',
+          labels: ['INBOX'],
+        },
+      ],
+      signals: ['restaurant', 'generic_receipt'],
+      has_specific_item_evidence: true,
+    }),
+  });
+
+  const result = await suggestTransactionCategories(reader, {
+    budgetId: COACH_BUDGET_ID,
+    sinceDate: '2026-04-01',
+    includeEmailEvidence: true,
+    emailEvidenceProvider: fake.provider,
+  });
+
+  const ambig = result.suggestions.find((s) => s.transaction_id === 'tx-ambig');
+  assert.ok(ambig);
+  assert.equal(ambig.suggestion.confidence, 'medium', 'item-level email signal should lift low → medium');
+  assert.ok(ambig.email_evidence);
+  assert.equal(ambig.email_evidence!.has_specific_item_evidence, true);
+  // Even with the upgrade we never auto-apply on a medium suggestion.
+  assert.equal(ambig.safe_to_apply, false);
+  assert.equal(ambig.review_state, 'needs_human_review');
+  assert.ok(
+    ambig.evidence.notes.some((n) => n.toLowerCase().includes('email signals')),
+    'evidence notes should list email signals'
+  );
+});
+
+test('suggest_transaction_categories: Amazon stays needs_human_review without item-level evidence', async () => {
+  const reader = createCoachFakeReader(makeCoachFixtureData());
+  const fake = fakeEmailEvidenceProvider({
+    'tx-amazon-needs-cat': makeFakeEvidence('tx-amazon-needs-cat', {
+      merchant_term: 'amazon',
+      messages: [
+        {
+          id: 'a1',
+          date: '2026-05-03 09:00',
+          from: 'Amazon Business <no-reply@business.amazon.com>',
+          subject: 'Add a backup payment to avoid order disruptions',
+          labels: ['INBOX', 'CATEGORY_UPDATES'],
+        },
+      ],
+      signals: ['amazon_order_generic'],
+      has_specific_item_evidence: false,
+    }),
+  });
+
+  const result = await suggestTransactionCategories(reader, {
+    budgetId: COACH_BUDGET_ID,
+    sinceDate: '2026-04-01',
+    includeEmailEvidence: true,
+    emailEvidenceProvider: fake.provider,
+  });
+
+  const amazon = result.suggestions.find((s) => s.transaction_id === 'tx-amazon-needs-cat');
+  assert.ok(amazon, 'amazon suggestion present');
+  // History alone produces 'high' confidence, but Amazon-like merchants must hold for review.
+  assert.equal(amazon.suggestion.confidence, 'high');
+  assert.equal(amazon.safe_to_apply, false);
+  assert.equal(amazon.review_state, 'needs_human_review');
+  assert.ok(
+    amazon.evidence.notes.some((n) => n.toLowerCase().includes('amazon-like payee')),
+    'should explain the Amazon hold'
+  );
+
+  // And if we add an item-specific evidence, it can flip safe-to-apply.
+  const fake2 = fakeEmailEvidenceProvider({
+    'tx-amazon-needs-cat': makeFakeEvidence('tx-amazon-needs-cat', {
+      merchant_term: 'amazon',
+      messages: [
+        {
+          id: 'a2',
+          date: '2026-05-03 09:00',
+          from: 'auto-confirm@amazon.com',
+          subject: 'Your Amazon.com order of "USB-C cable"',
+          labels: ['INBOX'],
+        },
+      ],
+      signals: ['amazon_item_specific'],
+      has_specific_item_evidence: true,
+    }),
+  });
+
+  const result2 = await suggestTransactionCategories(reader, {
+    budgetId: COACH_BUDGET_ID,
+    sinceDate: '2026-04-01',
+    includeEmailEvidence: true,
+    emailEvidenceProvider: fake2.provider,
+  });
+  const amazon2 = result2.suggestions.find((s) => s.transaction_id === 'tx-amazon-needs-cat');
+  assert.ok(amazon2);
+  assert.equal(amazon2.safe_to_apply, true, 'item-level evidence allows the high-confidence suggestion to be applied');
+  assert.equal(amazon2.review_state, 'safe_to_apply');
+});
+
+test('email-evidence helpers sanitize merchant tokens, build bounded queries, and classify signals', () => {
+  const tx = {
+    id: 't',
+    date: '2026-04-15',
+    amount: -10,
+    memo: null,
+    cleared: 'cleared',
+    approved: false,
+    flag_color: null,
+    account_id: 'a',
+    payee_id: null,
+    payee_name: 'AMAZON.COM*RX9YZ',
+    import_payee_name: null,
+    import_payee_name_original: null,
+    category_id: null,
+    category_name: null,
+    transfer_account_id: null,
+    transfer_transaction_id: null,
+    matched_transaction_id: null,
+    import_id: null,
+    deleted: false,
+    subtransactions: [] as never[],
+  };
+
+  const term = pickMerchantTerm(tx);
+  assert.equal(term, 'amazon');
+
+  const queries = buildGmailQueries(term as string, '2026-04-15', 7);
+  assert.equal(queries.length, 2);
+  for (const q of queries) {
+    assert.match(q, /after:2026\/4\/8/);
+    assert.match(q, /before:2026\/4\/23/);
+    // No shell metacharacters should leak into the query.
+    assert.doesNotMatch(q, /[`$;|&]/);
+  }
+
+  const { signals, itemSpecific } = classifyEmailSignals([
+    {
+      id: '1',
+      date: '2026-04-15',
+      from: 'auto-confirm@amazon.com',
+      subject: 'Your Amazon.com order of "Foo bar"',
+      labels: [],
+    },
+    {
+      id: '2',
+      date: '2026-04-15',
+      from: 'no-reply@business.amazon.com',
+      subject: 'Add a backup payment to avoid order disruptions',
+      labels: [],
+    },
+  ]);
+  assert.ok(signals.includes('amazon_item_specific'));
+  assert.ok(signals.includes('amazon_order_generic'));
+  assert.equal(itemSpecific, true);
 });
 
 test('budget coach reader is never asked to mutate', async () => {

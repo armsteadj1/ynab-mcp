@@ -185,6 +185,29 @@ export function makeCoachFixtureData(): CoachFakeData {
       payee_id: null, payee_name: 'Netflix',
       category_id: null, category_name: null, approved: false,
     }),
+    // Amazon historic categorizations (mixed-merchant: history alone shouldn't be enough to auto-apply)
+    makeTransaction('tx-amazon-historic-1', {
+      date: '2026-04-04', amount: -28_500,
+      payee_id: 'payee-amazon', payee_name: 'Amazon.com',
+      category_id: 'cat-james', category_name: 'James', approved: true,
+    }),
+    makeTransaction('tx-amazon-historic-2', {
+      date: '2026-04-11', amount: -41_200,
+      payee_id: 'payee-amazon', payee_name: 'Amazon.com',
+      category_id: 'cat-james', category_name: 'James', approved: true,
+    }),
+    makeTransaction('tx-amazon-historic-3', {
+      date: '2026-04-18', amount: -16_700,
+      payee_id: 'payee-amazon', payee_name: 'Amazon.com',
+      category_id: 'cat-james', category_name: 'James', approved: true,
+    }),
+    // New Amazon charge — payee history would push to "high" but item-level evidence is required.
+    makeTransaction('tx-amazon-needs-cat', {
+      date: '2026-05-03', amount: -22_300,
+      payee_id: 'payee-amazon', payee_name: 'Amazon.com',
+      import_payee_name: 'AMAZON.COM*RX9YZ',
+      category_id: null, category_name: null, approved: false,
+    }),
   ];
 
   const scheduled = [
@@ -223,6 +246,7 @@ export function makeCoachFixtureData(): CoachFakeData {
     { id: 'payee-bank', name: 'Mortgage Co.', transfer_account_id: null, deleted: false },
     { id: 'payee-daycare', name: 'Sunny Daycare', transfer_account_id: null, deleted: false },
     { id: 'payee-x', name: 'Some Future Bill', transfer_account_id: null, deleted: false },
+    { id: 'payee-amazon', name: 'Amazon.com', transfer_account_id: null, deleted: false },
   ];
 
   return {

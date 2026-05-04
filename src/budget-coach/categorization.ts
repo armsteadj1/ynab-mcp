@@ -5,6 +5,11 @@ import type {
   CoachTransaction,
   YnabCoachReader,
 } from './reader.js';
+import {
+  isAmazonLikeMerchant,
+  type EmailEvidenceProvider,
+  type TransactionEmailEvidence,
+} from './email-evidence.js';
 
 export interface QueueTransaction {
   id: string;
@@ -69,6 +74,8 @@ export interface SuggestedCategory {
   rationale: string;
 }
 
+export type SuggestionReviewState = 'safe_to_apply' | 'needs_human_review';
+
 export interface TransactionSuggestion {
   transaction_id: string;
   date: string;
@@ -81,6 +88,9 @@ export interface TransactionSuggestion {
   suggestion: SuggestedCategory;
   alternatives: SuggestedCategory[];
   evidence: SuggestionEvidence;
+  email_evidence: TransactionEmailEvidence | null;
+  safe_to_apply: boolean;
+  review_state: SuggestionReviewState;
 }
 
 export interface CategorizationSuggestionsResult {
@@ -90,6 +100,11 @@ export interface CategorizationSuggestionsResult {
   with_high_confidence: number;
   with_medium_confidence: number;
   with_low_confidence: number;
+  safe_to_apply_count: number;
+  needs_human_review_count: number;
+  email_evidence_used: boolean;
+  email_evidence_lookups: number;
+  email_evidence_with_matches: number;
   suggestions: TransactionSuggestion[];
   notes: string[];
 }
@@ -105,11 +120,15 @@ export interface SuggestCategoriesOptions {
   sinceDate?: string;
   transactionIds?: string[];
   limit?: number;
+  includeEmailEvidence?: boolean;
+  emailEvidenceProvider?: EmailEvidenceProvider;
+  emailEvidenceLimit?: number;
 }
 
 const DEFAULT_LOOKBACK_DAYS = 60;
 const DEFAULT_QUEUE_LIMIT = 100;
 const DEFAULT_SUGGEST_LIMIT = 50;
+const DEFAULT_EMAIL_EVIDENCE_LIMIT = 25;
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
@@ -402,6 +421,29 @@ export async function suggestTransactionCategories(
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, limit);
 
+  const useEmailEvidence = !!(opts.includeEmailEvidence && opts.emailEvidenceProvider);
+  const emailEvidenceLimit = Math.max(
+    0,
+    Math.min(opts.emailEvidenceLimit ?? DEFAULT_EMAIL_EVIDENCE_LIMIT, candidates.length)
+  );
+
+  const emailEvidenceByTx = new Map<string, TransactionEmailEvidence | null>();
+  let emailLookups = 0;
+  let emailMatches = 0;
+  if (useEmailEvidence && opts.emailEvidenceProvider) {
+    const targets = candidates.slice(0, emailEvidenceLimit);
+    for (const tx of targets) {
+      emailLookups += 1;
+      try {
+        const evidence = await opts.emailEvidenceProvider.searchForTransaction(tx);
+        emailEvidenceByTx.set(tx.id, evidence);
+        if (evidence && evidence.messages.length > 0) emailMatches += 1;
+      } catch {
+        emailEvidenceByTx.set(tx.id, null);
+      }
+    }
+  }
+
   const suggestions: TransactionSuggestion[] = candidates.map((tx) => {
     const hist =
       (tx.payee_id ? history.by_payee_id.get(tx.payee_id) : undefined) ??
@@ -475,6 +517,51 @@ export async function suggestTransactionCategories(
       }
     }
 
+    const emailEvidence = useEmailEvidence
+      ? emailEvidenceByTx.get(tx.id) ?? null
+      : null;
+
+    if (emailEvidence) {
+      if (emailEvidence.messages.length > 0) {
+        evidenceNotes.push(
+          `email: ${emailEvidence.messages.length} match(es) within window for "${emailEvidence.merchant_term ?? tx.payee_name}".`
+        );
+      }
+      if (emailEvidence.signals.length > 0) {
+        evidenceNotes.push(`email signals: ${emailEvidence.signals.join(', ')}`);
+      }
+      if (emailEvidence.messages.length === 0) {
+        evidenceNotes.push('email: no Gmail matches in window.');
+      }
+
+      // Email signals can lift an ambiguous low to medium so a human reviewer has context.
+      if (
+        suggestion.confidence === 'low' &&
+        emailEvidence.signals.length > 0 &&
+        emailEvidence.has_specific_item_evidence
+      ) {
+        suggestion = {
+          category_id: suggestion.category_id,
+          category_name: suggestion.category_name,
+          confidence: 'medium',
+          rationale: `${suggestion.rationale} Gmail evidence (${emailEvidence.signals.join(', ')}) gives item-level context — still verify the category before applying.`,
+        };
+      }
+    }
+
+    const isAmazon = isAmazonLikeMerchant(tx.payee_name, tx.import_payee_name);
+    let safeToApply: boolean;
+    if (suggestion.confidence !== 'high' || suggestion.category_id === null) {
+      safeToApply = false;
+    } else if (isAmazon && !(emailEvidence?.has_specific_item_evidence ?? false)) {
+      safeToApply = false;
+      evidenceNotes.push(
+        'Amazon-like payee: holding for human review until item-level email evidence is found.'
+      );
+    } else {
+      safeToApply = true;
+    }
+
     const alternatives: SuggestedCategory[] = ranked
       .slice(1, 4)
       .map((entry) => ({
@@ -503,16 +590,30 @@ export async function suggestTransactionCategories(
         payee_default_category_name: payeeDefaultCatName,
         notes: evidenceNotes,
       },
+      email_evidence: emailEvidence,
+      safe_to_apply: safeToApply,
+      review_state: safeToApply ? 'safe_to_apply' : 'needs_human_review',
     };
   });
 
   const high = suggestions.filter((s) => s.suggestion.confidence === 'high').length;
   const medium = suggestions.filter((s) => s.suggestion.confidence === 'medium').length;
   const low = suggestions.filter((s) => s.suggestion.confidence === 'low').length;
+  const safeCount = suggestions.filter((s) => s.safe_to_apply).length;
+  const reviewCount = suggestions.length - safeCount;
 
   const notes: string[] = [
     'Suggestions only — categories are not applied. Approval required before any future write.',
   ];
+  if (useEmailEvidence) {
+    notes.push(
+      `Gmail evidence enabled (read-only): looked up ${emailLookups} transaction(s); ${emailMatches} had matching message(s). Subject/from/date/labels only — no email contents read.`
+    );
+  } else {
+    notes.push(
+      'Gmail evidence disabled — pass include_email_evidence to enrich with read-only Gmail context.'
+    );
+  }
 
   return {
     budget_id: opts.budgetId,
@@ -521,6 +622,11 @@ export async function suggestTransactionCategories(
     with_high_confidence: high,
     with_medium_confidence: medium,
     with_low_confidence: low,
+    safe_to_apply_count: safeCount,
+    needs_human_review_count: reviewCount,
+    email_evidence_used: useEmailEvidence,
+    email_evidence_lookups: emailLookups,
+    email_evidence_with_matches: emailMatches,
     suggestions,
     notes,
   };

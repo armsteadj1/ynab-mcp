@@ -99,6 +99,20 @@ Use it as evidence, not as source of truth:
 - mark receipt as processed only after the transaction decision is resolved
 - future improvement: add receipt metadata fields for `ynab_transaction_id`, `ynab_category_id`, `ynab_category_confidence`, and `ynab_processed_at`
 
+### Optional Gmail evidence (read-only)
+
+`suggest_transaction_categories` can layer in Gmail evidence for each transaction. The seam is intentionally narrow:
+
+- Off by default. Enable per call with `include_email_evidence: true`.
+- The provider is abstracted as `EmailEvidenceProvider`; the production implementation is `GogEmailEvidenceProvider`, which shells out to the local `gog gmail messages search ... --json` CLI. Tests inject a fake provider — no real Gmail traffic during testing.
+- The CLI is invoked via `execFile` (no shell), with a bounded timeout, a max result count, and a date window of `±email_window_days` around the transaction. Merchant tokens are stripped to alphanumerics before becoming Gmail query terms, so payee strings can never inject query syntax or shell metacharacters.
+- Only `id`, `date`, `from`, `subject`, and `labels` are read off each message. Bodies, snippets, and attachments are not requested. The coach never sends mail, drafts, archives, deletes, or relabels anything.
+- Account is `email_account` → `YNAB_EMAIL_ACCOUNT` → personal default, in that order. `GOG_KEYRING_PASSWORD` is forwarded to the CLI but never logged.
+- Signals are coarse and category-flavored: `amazon_item_specific`, `amazon_order_generic`, `travel`, `lodging`, `rideshare`, `restaurant`, `subscription`, `medical`, `daycare`, `business_cloud`, `generic_receipt`. They are advisory, not authoritative.
+- Email evidence can lift an ambiguous *low* suggestion to *medium* when an item-level signal is present, but it never auto-promotes anything to `safe_to_apply`. `safe_to_apply: true` still requires `high` confidence and — for Amazon-like merchants — item-level email evidence.
+
+Failure mode: if the CLI times out, returns non-JSON, or finds nothing, the provider degrades to "no email evidence" rather than blowing up the suggestion.
+
 ## Weekly Review Guess
 
 A weekly review should be short and operational. Goal: keep the budget from drifting.

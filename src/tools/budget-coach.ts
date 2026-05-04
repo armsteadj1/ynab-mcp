@@ -20,6 +20,10 @@ import {
   type SuggestCategoriesOptions,
 } from '../budget-coach/categorization.js';
 import {
+  createGogEmailEvidenceProvider,
+  type EmailEvidenceProvider,
+} from '../budget-coach/email-evidence.js';
+import {
   getMonthlyBudgetReview,
   getWeeklyBudgetReview,
   type MonthlyBudgetReview,
@@ -81,15 +85,38 @@ export async function runCategorizationQueue(
   });
 }
 
+export interface RunSuggestCategoriesOptions
+  extends Partial<SuggestCategoriesOptions> {
+  budgetId?: string;
+  emailAccount?: string;
+  emailWindowDays?: number;
+  emailMaxResults?: number;
+  emailTimeoutMs?: number;
+}
+
 export async function runSuggestCategories(
-  opts: Partial<SuggestCategoriesOptions> & { budgetId?: string }
+  opts: RunSuggestCategoriesOptions
 ): Promise<CategorizationSuggestionsResult> {
   const budgetId = requireExplicitBudgetId(opts.budgetId);
+
+  let provider: EmailEvidenceProvider | undefined = opts.emailEvidenceProvider;
+  if (opts.includeEmailEvidence && !provider) {
+    provider = createGogEmailEvidenceProvider({
+      account: opts.emailAccount,
+      windowDays: opts.emailWindowDays,
+      maxResults: opts.emailMaxResults,
+      timeoutMs: opts.emailTimeoutMs,
+    });
+  }
+
   return suggestTransactionCategories(getCoachReader(), {
     budgetId,
     sinceDate: opts.sinceDate,
     transactionIds: opts.transactionIds,
     limit: opts.limit,
+    includeEmailEvidence: opts.includeEmailEvidence,
+    emailEvidenceProvider: provider,
+    emailEvidenceLimit: opts.emailEvidenceLimit,
   });
 }
 
