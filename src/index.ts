@@ -46,6 +46,13 @@ import {
   getSpendingByCategory,
   getIncomeSummary,
 } from './tools/analytics.js';
+import {
+  runSyncBudget,
+  readSyncStatus,
+  readTransactionsNeedingReview,
+  readWeeklyReview,
+  readMonthlyReview,
+} from './tools/local-sync.js';
 
 const server = new McpServer({
   name: 'ynab-mcp',
@@ -815,6 +822,204 @@ server.tool(
           {
             type: 'text',
             text: `Error getting income summary: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: sync_ynab_data
+server.tool(
+  'sync_ynab_data',
+  'Incrementally sync the local YNAB mirror (SQLite) for a budget. Uses YNAB server_knowledge so subsequent runs only fetch deltas. Read-only against YNAB; populates the local DB used by review/analysis tools. Pass full_resync=true to discard local server_knowledge and re-pull from scratch (local rows are still upserted, not deleted unless YNAB reports them deleted).',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID to sync (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not supported here — pass an explicit budget id.'),
+    full_resync: z
+      .boolean()
+      .optional()
+      .describe('Discard local server_knowledge and refetch all entities from YNAB. Defaults to false (incremental).'),
+  },
+  async ({ budget_id, full_resync }) => {
+    try {
+      const result = await runSyncBudget(budget_id, full_resync);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error syncing YNAB data: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_sync_status
+server.tool(
+  'get_sync_status',
+  'Report local sync state for a budget: per-resource server_knowledge, last_synced_at, and counts of mirrored entities. Reads only the local SQLite DB; no YNAB API calls.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided).'),
+  },
+  async ({ budget_id }) => {
+    try {
+      const status = readSyncStatus(budget_id);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(status, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error reading sync status: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_transactions_needing_review
+server.tool(
+  'get_transactions_needing_review',
+  'List transactions in the local mirror that look like they need attention: uncategorized, unapproved, or flagged. Reads from local SQLite — run sync_ynab_data first.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided).'),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .max(500)
+      .optional()
+      .describe('Max transactions to return (default 50).'),
+    since_date: z
+      .string()
+      .optional()
+      .describe('Only consider transactions on or after this date (YYYY-MM-DD). Defaults to last 60 days.'),
+  },
+  async ({ budget_id, limit, since_date }) => {
+    try {
+      const result = readTransactionsNeedingReview(budget_id, limit, since_date);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error reading transactions needing review: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_weekly_finance_review
+server.tool(
+  'get_weekly_finance_review',
+  'Generate a 7-day rolling finance review from the local mirror: spending, income, top categories/payees, account flow, and signals (large transactions, review backlog, overspent categories). Reads only from local SQLite.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided).'),
+    end_date: z
+      .string()
+      .optional()
+      .describe('End of the 7-day window (YYYY-MM-DD). Defaults to today. Period is end_date and the 6 preceding days, inclusive.'),
+  },
+  async ({ budget_id, end_date }) => {
+    try {
+      const review = readWeeklyReview(budget_id, end_date);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(review, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error generating weekly review: ${formatError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_monthly_finance_review
+server.tool(
+  'get_monthly_finance_review',
+  'Generate a calendar-month finance review from the local mirror: spending, income, top categories/payees, account flow, and signals. Reads only from local SQLite.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided).'),
+    month: z
+      .string()
+      .optional()
+      .describe('Month to review in YYYY-MM format. Defaults to the current calendar month.'),
+  },
+  async ({ budget_id, month }) => {
+    try {
+      const review = readMonthlyReview(budget_id, month);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(review, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error generating monthly review: ${formatError(error)}`,
           },
         ],
         isError: true,
