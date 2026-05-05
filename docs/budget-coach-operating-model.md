@@ -192,7 +192,7 @@ Categorization tools:
 - `get_categorization_queue`
 - `suggest_transaction_categories`
 - `match_receipts_to_transactions`
-- future: `apply_transaction_categories` with dry-run + explicit approval
+- `apply_categorization_suggestions` — controlled apply, dry-run by default, no-approval boundary (Phase 3)
 
 Review tools:
 
@@ -206,3 +206,28 @@ Review tools:
 - Any money movement/assignment requires exact proposed changes and explicit approval.
 - Never infer family goals as facts; ask and store answers separately.
 - Do not shame spending. Explain tradeoffs and options.
+
+## Phase 3 — Categorization Apply, No Approval
+
+`apply_categorization_suggestions` is the first and only coach tool that mutates YNAB. It runs under a deliberately narrow boundary so categorization can keep up with reality without ever silently approving spend.
+
+Allowed mutations:
+
+- Set a transaction's `category_id`.
+- Replace or create split `subtransactions` (sum must equal the original transaction amount in milliunits).
+- Add a `memo` (or `memo_reason`) only when the transaction memo is currently blank — used to record why a category/split was chosen.
+
+Forbidden mutations:
+
+- Never sets `approved: true`. Transactions must stay unapproved and visible in the YNAB inbox.
+- Never changes `cleared`, `date`, `amount`, `payee`, `account`, or `import_id`.
+- Never moves assigned budget dollars.
+- No raw passthrough to the YNAB update endpoint — the tool builds a minimal `{category_id?, subtransactions?, memo?}` payload only.
+
+Behavior:
+
+- `dry_run` defaults to `true`. The dry-run response contains before/after previews and the list of fields that would change so a human can review the exact write before it happens.
+- Apply mode (`dry_run: false`) accepts the exact same `changes[]` payload — the tool never re-infers categories at apply time.
+- Each change is fetched live before the write to compute the diff and to confirm the transaction is not a transfer or deleted.
+- Existing non-blank memos are preserved by default; the `memo`/`memo_reason` is reported as `preserved_existing` rather than overwriting human notes.
+- After the write, the tool reports `approved_after_apply` and warns if YNAB unexpectedly returned `approved: true`.

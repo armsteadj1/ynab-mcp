@@ -31,6 +31,12 @@ import {
   type WeeklyBudgetReview,
   type WeeklyReviewOptions,
 } from '../budget-coach/reviews.js';
+import {
+  applyCategorization,
+  getCategorizationWriter,
+  type ApplyCategorizationOptions,
+  type ApplyCategorizationResult,
+} from '../budget-coach/apply-categorization.js';
 
 function requireExplicitBudgetId(budgetId?: string): string {
   const resolved = resolveBudgetId(budgetId);
@@ -139,5 +145,16 @@ export async function runMonthlyBudgetReview(
     budgetId,
     month: opts.month,
     largeTxDollars: opts.largeTxDollars,
+  });
+}
+
+export async function runApplyCategorization(
+  opts: Omit<ApplyCategorizationOptions, 'budgetId'> & { budgetId?: string }
+): Promise<ApplyCategorizationResult> {
+  const budgetId = requireExplicitBudgetId(opts.budgetId);
+  return applyCategorization(getCategorizationWriter(), {
+    budgetId,
+    dryRun: opts.dryRun,
+    changes: opts.changes,
   });
 }

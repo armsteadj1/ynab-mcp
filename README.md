@@ -143,8 +143,25 @@ These tools read the YNAB API directly and never mutate the budget. They drive t
 | `suggest_transaction_categories` | categorization | Suggests a category per transaction with confidence (high/medium/low), rationale, evidence (prior examples, payee default), ranked alternatives, and a `safe_to_apply` / `review_state` decision. Optional `include_email_evidence: true` enriches each suggestion with read-only Gmail context (subject/from/date/labels only) via the local `gog` CLI; Amazon-like merchants are held for human review unless item-level email evidence is present. |
 | `get_weekly_budget_review` | review | Operating-model weekly review: inbox health, overspending + funding source candidates, cash assignment, notable spending (large/unusual/new recurring), and explicit next actions. |
 | `get_monthly_budget_review` | review | Operating-model monthly review: month close readiness, budget performance, true-expense status, family-narrative anchors, next-month plan with priorities and questions for humans. |
+| `apply_categorization_suggestions` | categorization (write, no-approval) | Controlled apply for categorization. Defaults to `dry_run: true`. Allowed mutations: set category, replace/create split subtransactions, and add a memo only when the existing memo is blank. Forbidden: never sets `approved`, never changes `cleared`/`date`/`amount`/`payee`/`account`/`import_id`. After apply, transactions remain unapproved by design. |
 
-Approval posture: every coach tool above is read-only. Any future write tool (e.g., `apply_transaction_categories`, `apply_assignment_plan`) must default to dry-run and require explicit user approval before mutating YNAB.
+Approval posture: every read-only coach tool above is dry-run by definition. The single write tool, `apply_categorization_suggestions`, defaults to `dry_run: true`, accepts the exact proposed changes, fetches each current transaction first, and never approves or otherwise mutates anything outside category, subtransactions, or memo. Any future assignment-write tool (e.g., `apply_assignment_plan`) must follow the same posture.
+
+#### `apply_categorization_suggestions` boundary
+
+This is the only coach tool that mutates YNAB. James has approved a narrow, no-approval boundary:
+
+- **Allowed after dry-run review**:
+  - Set a transaction's category.
+  - Replace or create split subtransactions (sum must match the original transaction amount in milliunits).
+  - Add a memo only when the existing memo is blank — to record why the category/split was chosen.
+- **Forbidden**:
+  - Never sets `approved: true`. The transaction must stay unapproved so it lands in the YNAB inbox for human review.
+  - Never changes `cleared`, `date`, `amount`, `payee`, `account`, or `import_id`.
+  - Never moves assigned budget dollars.
+  - No raw passthrough to the YNAB transactions update endpoint — the tool builds a minimal payload of `{category_id?, subtransactions?, memo?}` only.
+- **Inputs**: `budget_id`, `dry_run` (default `true`), and `changes[]` where each change has `transaction_id` and either `category_id` or `subtransactions[]`, plus optional `memo`/`memo_reason`.
+- **Output**: `applied[]` with before/after previews and `changed_fields`, plus `skipped[]` (e.g., transfers, no-op changes, existing memos preserved) and `errors[]` (e.g., subtransaction sum mismatch, both `category_id` and `subtransactions` provided, forbidden field passthrough attempts).
 
 #### Optional Gmail evidence for categorization
 

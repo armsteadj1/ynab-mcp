@@ -61,6 +61,7 @@ import {
   runSuggestCategories,
   runWeeklyBudgetReview,
   runMonthlyBudgetReview,
+  runApplyCategorization,
 } from './tools/budget-coach.js';
 
 const server = new McpServer({
@@ -1355,6 +1356,86 @@ server.tool(
       return {
         content: [
           { type: 'text', text: `Error generating monthly budget review: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: apply_categorization_suggestions
+server.tool(
+  'apply_categorization_suggestions',
+  'Controlled apply for transaction categorization suggestions. Allowed mutations: set category, replace/create split subtransactions, and add a memo only when the existing memo is blank. Forbidden: never set approved, change cleared status, or modify amount/date/payee/account/import id. Defaults to dry_run: true and returns before/after previews. After dry-run review, re-call with dry_run: false to write the exact same changes. Subtransactions must sum to the original transaction amount in milliunits.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe('Defaults to true. When true, no YNAB writes occur and the response is a before/after preview.'),
+    changes: z
+      .array(
+        z
+          .object({
+            transaction_id: z.string().describe('YNAB transaction id to update.'),
+            category_id: z
+              .string()
+              .optional()
+              .describe('Target category id. Mutually exclusive with subtransactions.'),
+            subtransactions: z
+              .array(
+                z.object({
+                  category_id: z.string().describe('Subtransaction category id.'),
+                  amount_milliunits: z
+                    .number()
+                    .int()
+                    .describe('Amount in milliunits (1000 = $1.00). Sum of all subtransactions must equal the original transaction amount in milliunits.'),
+                  memo: z.string().optional().describe('Optional per-subtransaction memo.'),
+                })
+              )
+              .optional()
+              .describe('Replace/create split subtransactions. Mutually exclusive with category_id.'),
+            memo: z
+              .string()
+              .optional()
+              .describe('Memo to add only when the transaction currently has no memo. Existing memos are preserved by default.'),
+            memo_reason: z
+              .string()
+              .optional()
+              .describe('Optional rationale used as the memo when memo is not provided and the transaction memo is blank.'),
+          })
+          .describe('Exact change to apply. The tool only honors category_id, subtransactions, memo, and memo_reason — any other field is rejected.')
+      )
+      .min(1)
+      .describe('Exact list of changes to apply. The tool fetches each current transaction first and validates the proposal before any write.'),
+  },
+  async ({ budget_id, dry_run, changes }) => {
+    try {
+      const result = await runApplyCategorization({
+        budgetId: budget_id,
+        dryRun: dry_run,
+        changes: changes.map((c) => ({
+          transaction_id: c.transaction_id,
+          category_id: c.category_id,
+          subtransactions: c.subtransactions?.map((s) => ({
+            category_id: s.category_id,
+            amount_milliunits: s.amount_milliunits,
+            memo: s.memo,
+          })),
+          memo: c.memo,
+          memo_reason: c.memo_reason,
+        })),
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error applying categorization: ${formatError(error)}` },
         ],
         isError: true,
       };
