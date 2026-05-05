@@ -254,3 +254,9 @@ YNAB_API_TOKEN=your-token npx @modelcontextprotocol/inspector node dist/index.js
 ## License
 
 MIT
+
+
+## Approval Safety
+
+- **No auto-approval**: categorization apply never approves transactions; review remains in YNAB.
+- Created/imported transactions also default to unapproved so a human can approve them in YNAB.

@@ -73,7 +73,7 @@ export async function createTransaction(
     category_id: transaction.category_id || undefined,
     memo: transaction.memo || undefined,
     cleared: clearedStatus,
-    approved: true,
+    approved: false,
   };
 
   // Add subtransactions if provided
@@ -146,7 +146,7 @@ export async function createTransactionsBatch(
       category_id: tx.category_id || undefined,
       memo: tx.memo || undefined,
       cleared: clearedStatus,
-      approved: true,
+      approved: false,
     };
 
     // Add subtransactions if provided
