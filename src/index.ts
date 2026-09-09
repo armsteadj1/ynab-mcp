@@ -53,6 +53,16 @@ import {
   readWeeklyReview,
   readMonthlyReview,
 } from './tools/local-sync.js';
+import {
+  runPlanningSnapshot,
+  runFindMonthsNeedingHelp,
+  runExplainOverspending,
+  runCategorizationQueue,
+  runSuggestCategories,
+  runWeeklyBudgetReview,
+  runMonthlyBudgetReview,
+  runApplyCategorization,
+} from './tools/budget-coach.js';
 
 const server = new McpServer({
   name: 'ynab-mcp',
@@ -1021,6 +1031,411 @@ server.tool(
             type: 'text',
             text: `Error generating monthly review: ${formatError(error)}`,
           },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_budget_planning_snapshot
+server.tool(
+  'get_budget_planning_snapshot',
+  'Read-only planning snapshot for a budget month: Ready to Assign, overspent categories, underfunded targets, hard obligations, everyday/true-expense/savings classifications, funding-source candidates, and upcoming scheduled obligations. Live YNAB read; no mutations. Approval required for any future assignment.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    month: z
+      .string()
+      .optional()
+      .describe('Month in YYYY-MM format. Defaults to the current calendar month.'),
+  },
+  async ({ budget_id, month }) => {
+    try {
+      const result = await runPlanningSnapshot({ budgetId: budget_id, month });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error building planning snapshot: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: find_months_needing_budget_help
+server.tool(
+  'find_months_needing_budget_help',
+  'Inspect the current and recent months to identify which need budget attention. Reasons include: ready_to_assign, overspent_categories, underfunded_targets, previous_month_overspending, credit_card_payment_issues. Live YNAB read; no mutations.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    months_back: z
+      .number()
+      .int()
+      .min(0)
+      .max(11)
+      .optional()
+      .describe('How many prior months to inspect in addition to the current month (default 2).'),
+    as_of_month: z
+      .string()
+      .optional()
+      .describe('Anchor month in YYYY-MM. Defaults to the current month.'),
+  },
+  async ({ budget_id, months_back, as_of_month }) => {
+    try {
+      const result = await runFindMonthsNeedingHelp({
+        budgetId: budget_id,
+        monthsBack: months_back,
+        asOfMonth: as_of_month,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error finding months needing help: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: explain_overspending
+server.tool(
+  'explain_overspending',
+  'Explain overspending for a budget month in plain language: which categories are negative, by how much, and likely funding source candidates. Advisory only — no money is moved. Approval required for any future assignment.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    month: z
+      .string()
+      .optional()
+      .describe('Month in YYYY-MM format. Defaults to the current calendar month.'),
+    category_id: z
+      .string()
+      .optional()
+      .describe('Optional category ID to focus the explanation on a single overspent category.'),
+  },
+  async ({ budget_id, month, category_id }) => {
+    try {
+      const result = await runExplainOverspending({
+        budgetId: budget_id,
+        month,
+        categoryId: category_id,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error explaining overspending: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_categorization_queue
+server.tool(
+  'get_categorization_queue',
+  'List transactions needing categorization or approval, with duplicate-payee groups for batch handling. Live YNAB read; transfers excluded. No categories are applied.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    since_date: z
+      .string()
+      .optional()
+      .describe('Only consider transactions on or after this date (YYYY-MM-DD). Defaults to the last 60 days.'),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .max(500)
+      .optional()
+      .describe('Max queue rows to return (default 100).'),
+  },
+  async ({ budget_id, since_date, limit }) => {
+    try {
+      const result = await runCategorizationQueue({
+        budgetId: budget_id,
+        sinceDate: since_date,
+        limit,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error building categorization queue: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: suggest_transaction_categories
+server.tool(
+  'suggest_transaction_categories',
+  'Suggest categories for uncategorized/unapproved transactions using payee history, prior approved categorizations, and merchant keywords. Each suggestion includes confidence (high/medium/low), rationale, evidence, and a safe_to_apply flag. Optional read-only Gmail evidence (subject/from/date/labels only) via the local `gog` CLI can enrich the rationale and gate Amazon-like merchants. Read-only; no categories are applied and no email is sent.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    since_date: z
+      .string()
+      .optional()
+      .describe('Only consider transactions on or after this date (YYYY-MM-DD). Defaults to the last 60 days.'),
+    transaction_ids: z
+      .array(z.string())
+      .optional()
+      .describe('Optional explicit list of transaction IDs to suggest categories for. Without this, all uncategorized/unapproved transactions in the window are considered.'),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .max(200)
+      .optional()
+      .describe('Max suggestions to return (default 50).'),
+    include_email_evidence: z
+      .boolean()
+      .optional()
+      .describe('Enrich suggestions with read-only Gmail evidence using the local `gog` CLI. Off by default. Subject/from/date/labels only — no email contents are read, sent, or modified.'),
+    email_account: z
+      .string()
+      .optional()
+      .describe('Gmail account to query (defaults to YNAB_EMAIL_ACCOUNT env var, then armsteadj1@gmail.com).'),
+    email_window_days: z
+      .number()
+      .int()
+      .positive()
+      .max(30)
+      .optional()
+      .describe('Date window (in days, +/-) around each transaction when searching Gmail. Defaults to 7.'),
+    email_max_results: z
+      .number()
+      .int()
+      .positive()
+      .max(20)
+      .optional()
+      .describe('Max Gmail messages to retrieve per transaction. Defaults to 5.'),
+    email_evidence_limit: z
+      .number()
+      .int()
+      .positive()
+      .max(200)
+      .optional()
+      .describe('Max number of transactions to look up Gmail evidence for in one call. Defaults to 25.'),
+  },
+  async ({
+    budget_id,
+    since_date,
+    transaction_ids,
+    limit,
+    include_email_evidence,
+    email_account,
+    email_window_days,
+    email_max_results,
+    email_evidence_limit,
+  }) => {
+    try {
+      const result = await runSuggestCategories({
+        budgetId: budget_id,
+        sinceDate: since_date,
+        transactionIds: transaction_ids,
+        limit,
+        includeEmailEvidence: include_email_evidence,
+        emailAccount: email_account,
+        emailWindowDays: email_window_days,
+        emailMaxResults: email_max_results,
+        emailEvidenceLimit: email_evidence_limit,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error suggesting categories: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_weekly_budget_review
+server.tool(
+  'get_weekly_budget_review',
+  'Operating-model weekly review built from live YNAB reads: inbox health, overspending with funding source candidates, cash assignment status (Ready to Assign, underfunded hard obligations, near-term run-out), notable spending (large transactions, unusual payees, new recurring charges), and concrete next actions. Read-only — no mutations.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    end_date: z
+      .string()
+      .optional()
+      .describe('End of the 7-day review window (YYYY-MM-DD). Defaults to today.'),
+    large_tx_dollars: z
+      .number()
+      .positive()
+      .optional()
+      .describe('Threshold for "large transaction" notable spending signal (default 250).'),
+  },
+  async ({ budget_id, end_date, large_tx_dollars }) => {
+    try {
+      const result = await runWeeklyBudgetReview({
+        budgetId: budget_id,
+        endDate: end_date,
+        largeTxDollars: large_tx_dollars,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error generating weekly budget review: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: get_monthly_budget_review
+server.tool(
+  'get_monthly_budget_review',
+  'Operating-model monthly review built from live YNAB reads: month close readiness, budget performance with category deltas, true-expense/sinking-fund status, family-narrative anchors, and a next-month plan. Read-only — no mutations.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    month: z
+      .string()
+      .optional()
+      .describe('Month to review in YYYY-MM format. Defaults to the current calendar month.'),
+    large_tx_dollars: z
+      .number()
+      .positive()
+      .optional()
+      .describe('Threshold for "large transaction" highlights (default 250).'),
+  },
+  async ({ budget_id, month, large_tx_dollars }) => {
+    try {
+      const result = await runMonthlyBudgetReview({
+        budgetId: budget_id,
+        month,
+        largeTxDollars: large_tx_dollars,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error generating monthly budget review: ${formatError(error)}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: apply_categorization_suggestions
+server.tool(
+  'apply_categorization_suggestions',
+  'Controlled apply for transaction categorization suggestions. Allowed mutations: set category, replace/create split subtransactions, and add a memo only when the existing memo is blank. Forbidden: never set approved, change cleared status, or modify amount/date/payee/account/import id. Defaults to dry_run: true and returns before/after previews. After dry-run review, re-call with dry_run: false to write the exact same changes. Subtransactions must sum to the original transaction amount in milliunits.',
+  {
+    budget_id: z
+      .string()
+      .optional()
+      .describe('Budget ID (uses YNAB_BUDGET_ID env var if not provided). The "last-used" alias is not accepted.'),
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe('Defaults to true. When true, no YNAB writes occur and the response is a before/after preview.'),
+    changes: z
+      .array(
+        z
+          .object({
+            transaction_id: z.string().describe('YNAB transaction id to update.'),
+            category_id: z
+              .string()
+              .optional()
+              .describe('Target category id. Mutually exclusive with subtransactions.'),
+            subtransactions: z
+              .array(
+                z.object({
+                  category_id: z.string().describe('Subtransaction category id.'),
+                  amount_milliunits: z
+                    .number()
+                    .int()
+                    .describe('Amount in milliunits (1000 = $1.00). Sum of all subtransactions must equal the original transaction amount in milliunits.'),
+                  memo: z.string().optional().describe('Optional per-subtransaction memo.'),
+                })
+              )
+              .optional()
+              .describe('Replace/create split subtransactions. Mutually exclusive with category_id.'),
+            memo: z
+              .string()
+              .optional()
+              .describe('Memo to add only when the transaction currently has no memo. Existing memos are preserved by default.'),
+            memo_reason: z
+              .string()
+              .optional()
+              .describe('Optional rationale used as the memo when memo is not provided and the transaction memo is blank.'),
+          })
+          .describe('Exact change to apply. The tool only honors category_id, subtransactions, memo, and memo_reason — any other field is rejected.')
+      )
+      .min(1)
+      .describe('Exact list of changes to apply. The tool fetches each current transaction first and validates the proposal before any write.'),
+  },
+  async ({ budget_id, dry_run, changes }) => {
+    try {
+      const result = await runApplyCategorization({
+        budgetId: budget_id,
+        dryRun: dry_run,
+        changes: changes.map((c) => ({
+          transaction_id: c.transaction_id,
+          category_id: c.category_id,
+          subtransactions: c.subtransactions?.map((s) => ({
+            category_id: s.category_id,
+            amount_milliunits: s.amount_milliunits,
+            memo: s.memo,
+          })),
+          memo: c.memo,
+          memo_reason: c.memo_reason,
+        })),
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: 'text', text: `Error applying categorization: ${formatError(error)}` },
         ],
         isError: true,
       };
